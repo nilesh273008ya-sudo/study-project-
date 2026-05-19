@@ -384,12 +384,26 @@ app.get('/api/lectures/:id', authenticate, async (req, res) => {
 app.post('/api/lectures', authenticate, isAdmin, async (req, res) => {
     const { subjectId, chapterId, title, date, duration, youtubeId, imageUrl, pdfLink, dppLink } = req.body;
     if (!subjectId || !chapterId || !title) return res.status(400).json({ success: false, msg: 'Missing required fields' });
-    const lecture = await Lecture.create({ subjectId, chapterId, title, date, duration, youtubeId, imageUrl, pdfLink, dppLink });
+    const lecture = await Lecture.create({
+        subjectId, chapterId, title, date, duration, youtubeId, imageUrl,
+        pdfLink, dppLink,
+        printableNotesLink: req.body.printableNotesLink || '',
+        remark: req.body.remark || ''
+    });
     res.json({ success: true, lecture });
 });
 
 app.put('/api/lectures/:id', authenticate, isAdmin, async (req, res) => {
-    const updates = req.body;
+    const { title, youtubeId, imageUrl, pdfLink, dppLink, printableNotesLink, remark } = req.body;
+    const updates = {};
+    if (title !== undefined) updates.title = title;
+    if (youtubeId !== undefined) updates.youtubeId = youtubeId;
+    if (imageUrl !== undefined) updates.imageUrl = imageUrl;
+    if (pdfLink !== undefined) updates.pdfLink = pdfLink;
+    if (dppLink !== undefined) updates.dppLink = dppLink;
+    if (printableNotesLink !== undefined) updates.printableNotesLink = printableNotesLink;
+    if (remark !== undefined) updates.remark = remark;
+
     const lecture = await Lecture.findByIdAndUpdate(req.params.id, updates, { new: true });
     res.json({ success: true, lecture });
 });

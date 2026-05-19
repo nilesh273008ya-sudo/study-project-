@@ -12,7 +12,9 @@ const lectureSchema = new mongoose.Schema({
 
   // Notes & DPP Features (already present in your original)
   pdfLink: String,     // Google Drive / direct link for Notes PDF
-  dppLink: String      // Google Drive / direct link for DPP PDF
+  dppLink: String,      // Google Drive / direct link for DPP PDF
+  printableNotesLink: { type: String, default: '' },   // separate link for print‑friendly version
+  remark: { type: String, default: '' }                // admin note, shown with info icon
 }, { timestamps: true });
 
 const Lecture = mongoose.model('Lecture', lectureSchema);
