@@ -5,9 +5,8 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 const path = require('path');
-const { body, validationResult } = require('express-validator');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,15 +18,20 @@ const Chapter = require('./models/Chapter');
 const Lecture = require('./models/Lecture');
 const Dpp = require('./models/Dpp');
 const DppResult = require('./models/DppResult');
-const Otp = require('./models/Otp');
 const LiveSchedule = require('./models/LiveSchedule');
-const Progress = require('./models/Progress'); // for lecture completion
+const Progress = require('./models/Progress');
 const MotivationSchedule = require('./models/MotivationSchedule');
 const StudyLog = require('./models/StudyLog');
 const RevisionItem = require('./models/RevisionItem');
 const TopicPerformance = require('./models/TopicPerformance');
 const PlannerTask = require('./models/PlannerTask');
 
+// ========== NEW ROUTES ==========
+const courseRoutes = require('./routes/courses');
+const streamRoutes = require('./routes/stream');
+const downloadRoutes = require('./routes/download');
+
+// ========== HELPERS ==========
 function detectTopic(questionText) {
     const text = questionText.toLowerCase();
     if (text.includes('%') || text.includes('percent') || text.includes('percentage')) return 'Percentage';
@@ -65,23 +69,17 @@ app.use(cors({
     credentials: true
 }));
 
-/*app.set('view engine', 'ejs')*/;
+// Mount new API routes
+app.use('/api/courses', courseRoutes);
+app.use('/api/stream', streamRoutes);
+app.use('/api/download', downloadRoutes);
 
-// 🆕 Disable caching for all API routes – prevents stale data after bfcache
+// Disable caching for all API routes
 app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
     next();
-});
-
-// ========== NODEMAILER ==========
-const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    }
 });
 
 // ========== AUTH MIDDLEWARE ==========
@@ -97,17 +95,13 @@ const authenticate = (req, res, next) => {
     }
 };
 
-// Redirect authenticated users away from public pages
 const redirectIfAuthenticated = (req, res, next) => {
     const token = req.cookies.token;
-    if (!token) return next(); // not logged in, proceed normally
-
+    if (!token) return next();
     try {
         jwt.verify(token, process.env.JWT_SECRET);
-        // Token is valid → user is logged in, send them to dashboard
         return res.redirect('/dashboard.html');
     } catch (err) {
-        // Invalid/expired token → clear cookie and continue
         res.clearCookie('token');
         next();
     }
@@ -119,8 +113,6 @@ const isAdmin = (req, res, next) => {
 };
 
 // ========== PUBLIC ROUTES ==========
-// Public pages – redirect logged-in users to dashboard
-// Helper to set no-cache headers
 const setNoCache = (res) => {
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.set('Pragma', 'no-cache');
@@ -147,77 +139,45 @@ app.get('/forgot-password.html', redirectIfAuthenticated, (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'forgot-password.html'));
 });
 
-// Send OTP
-app.post('/api/send-otp', async (req, res) => {
+// ========== AUTH ROUTES (Resend – no OTP) ==========
+app.post('/api/signup', async (req, res) => {
     try {
-        const { email } = req.body;
-        if (!email) return res.status(400).json({ success: false, msg: 'Email required' });
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        await Otp.findOneAndUpdate(
-            { email },
-            { otp, expiresAt: new Date(Date.now() + 10 * 60 * 1000) },
-                                   { upsert: true, new: true }
-        );
-        await transporter.sendMail({
-            from: process.env.EMAIL_USER,
-            to: email,
-            subject: 'Your Signup OTP - My PW',
-            html: `<div style="font-family: Arial; max-width:500px; margin:auto; padding:20px; background:#f8fafc; border-radius:12px;">
-            <h2 style="color:#1e40af; text-align:center;">My PW</h2>
-            <div style="background:white; padding:20px; border-radius:10px; text-align:center;">
-            <h1 style="font-size:42px; letter-spacing:8px; color:#1e40af;">${otp}</h1>
-            </div>
-            <p style="text-align:center;">Valid for 10 minutes.</p>
-            </div>`
-        });
-        res.json({ success: true, msg: 'OTP sent' });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ success: false, msg: 'Failed to send OTP' });
-    }
-});
-
-// Verify OTP
-app.post('/api/verify-otp', async (req, res) => {
-    try {
-        const { email, otp } = req.body;
-        const record = await Otp.findOne({ email });
-        if (!record || record.otp !== otp) return res.status(400).json({ success: false, msg: 'Invalid OTP' });
-        await Otp.deleteOne({ email });
-        res.json({ success: true, msg: 'OTP verified' });
-    } catch (error) {
-        res.status(500).json({ success: false, msg: 'Verification failed' });
-    }
-});
-
-// Signup (with OTP check)
-app.post('/api/signup', [
-    body('name').trim().notEmpty(),
-         body('email').isEmail().normalizeEmail(),
-         body('password').isLength({ min: 6 }),
-         body('otp').notEmpty()
-], async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
-    try {
-        const { name, email, password, otp } = req.body;
-        const otpRecord = await Otp.findOne({ email });
-        if (!otpRecord || otpRecord.otp !== otp) return res.status(400).json({ success: false, msg: 'Invalid OTP' });
+        const { name, email, password } = req.body;
+        if (!name || !email || !password) return res.status(400).json({ success: false, msg: 'Missing fields' });
         const existing = await User.findOne({ email });
         if (existing) return res.status(400).json({ success: false, msg: 'Email already registered' });
-        //const hashedPassword = await bcrypt.hash(password, 10);
+
         const user = await User.create({ name, email, password });
-        await Otp.deleteOne({ email });
-        const token = jwt.sign({ id: user._id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '7d' });
-        res.cookie('token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 });
-        res.json({ success: true, msg: 'Account created', user: { id: user._id, name, email, role: user.role } });
+
+        const token = crypto.randomBytes(32).toString('hex');
+        user.verificationToken = token;
+        user.verificationTokenExpires = new Date(Date.now() + 3600000);
+        await user.save();
+
+        const { sendVerificationEmail } = require('./utils/emailService');
+        await sendVerificationEmail(user.email, token, name);
+
+        res.status(201).json({ success: true, msg: 'Account created. Check your email to verify.' });
     } catch (error) {
         console.error(error);
         res.status(500).json({ success: false, msg: 'Server error' });
     }
 });
 
-// Login
+app.get('/api/verify-email', async (req, res) => {
+    const { token } = req.query;
+    const user = await User.findOne({
+        verificationToken: token,
+        verificationTokenExpires: { $gt: new Date() }
+    });
+    if (!user) return res.status(400).send('Invalid or expired verification link.');
+    user.verified = true;
+    user.verificationToken = undefined;
+    user.verificationTokenExpires = undefined;
+    await user.save();
+    res.redirect('/login.html?verified=true');
+});
+
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -233,64 +193,42 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Logout
 app.post('/api/logout', (req, res) => {
     res.clearCookie('token');
     res.json({ success: true, msg: 'Logged out' });
 });
 
-// GET user topic analytics
-app.get('/api/analytics/topics', authenticate, async (req, res) => {
+// ========== FORGOT / RESET PASSWORD (Resend) ==========
+app.post('/api/forgot-password', async (req, res) => {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ success: false, msg: 'No account with that email' });
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    user.resetPasswordToken = token;
+    user.resetPasswordExpires = Date.now() + 3600000;
+    await user.save();
+
+    const resetLink = `${process.env.BASE_URL || 'http://localhost:3000'}/reset-password.html?token=${token}`;
+    const { sendResetEmail } = require('./utils/emailService');
     try {
-        let performances = await TopicPerformance.find({ userId: req.user.id });
-        if (!performances) performances = [];
-        // Sort in JavaScript (accuracy is a virtual)
-        performances.sort((a, b) => (a.accuracy || 0) - (b.accuracy || 0));
-        res.json(performances);
+        await sendResetEmail(email, resetLink);
+        res.json({ success: true, msg: 'Reset link sent to your email' });
     } catch (error) {
-        console.error('Analytics error:', error);
-        res.status(500).json([]); // Return empty array instead of error object
+        console.error('Email sending error:', error);
+        res.status(500).json({ success: false, msg: 'Failed to send email' });
     }
 });
 
-// GET weak topics below threshold (default 50%)
-app.get('/api/analytics/weak-topics', authenticate, async (req, res) => {
-    const threshold = parseInt(req.query.threshold) || 50;
-    let all = await TopicPerformance.find({ userId: req.user.id, totalQuestions: { $gt: 5 } });
-    const weak = all.filter(p => p.accuracy < threshold);
-    res.json(weak);
-});
-
-// GET custom practice questions from specified topics
-app.get('/api/practice/custom', authenticate, async (req, res) => {
-    let topics = req.query.topics;
-    if (!topics) return res.status(400).json({ error: 'topics required' });
-    const topicArray = topics.split(',');
-    const limit = parseInt(req.query.limit) || 10;
-    const dpps = await Dpp.find({ 'questions.topic': { $in: topicArray } });
-    let questions = [];
-    for (const dpp of dpps) {
-        for (const q of dpp.questions) {
-            if (topicArray.includes(q.topic)) {
-                questions.push({
-                    id: q.id,
-                    text: q.questionText,
-                    options: q.options,
-                    correctAnswer: q.correctAnswer,
-                    topic: q.topic,
-                    lectureId: dpp.lectureId,
-                    lectureName: dpp.lectureName
-                });
-            }
-        }
-    }
-    // Shuffle and limit
-    for (let i = questions.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [questions[i], questions[j]] = [questions[j], questions[i]];
-    }
-    questions = questions.slice(0, limit);
-    res.json(questions);
+app.post('/api/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body;
+    const user = await User.findOne({ resetPasswordToken: token, resetPasswordExpires: { $gt: Date.now() } });
+    if (!user) return res.status(400).json({ success: false, msg: 'Invalid or expired token' });
+    user.password = newPassword;
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+    res.json({ success: true, msg: 'Password reset successful' });
 });
 
 // ========== PROTECTED ROUTES ==========
@@ -299,18 +237,18 @@ app.get('/api/me', authenticate, async (req, res) => {
     res.json({ success: true, user });
 });
 
-// ---------- SUBJECTS ----------
+// ---------- SUBJECTS (filter by course) ----------
 app.get('/api/subjects', authenticate, async (req, res) => {
-    const subjects = await Subject.find().sort('order');
+    const filter = {};
+    if (req.query.courseId) filter.courseId = req.query.courseId;
+    const subjects = await Subject.find(filter).sort('order');
     res.json(subjects);
 });
 
 app.post('/api/subjects', authenticate, isAdmin, async (req, res) => {
-    const { name, icon, color } = req.body;
+    const { name, icon, color, courseId } = req.body;
     if (!name) return res.status(400).json({ success: false, msg: 'Name required' });
-    const existing = await Subject.findOne({ name });
-    if (existing) return res.status(400).json({ success: false, msg: 'Subject already exists' });
-    const subject = await Subject.create({ name, icon, color });
+    const subject = await Subject.create({ name, icon, color, courseId });
     res.json({ success: true, subject });
 });
 
@@ -350,7 +288,7 @@ app.delete('/api/chapters/:id', authenticate, isAdmin, async (req, res) => {
     res.json({ success: true });
 });
 
-// ---------- LECTURES ----------
+// ---------- LECTURES (with downloadMode) ----------
 app.get('/api/lectures', authenticate, async (req, res) => {
     const { subjectId, chapterId } = req.query;
     let query = {};
@@ -358,19 +296,16 @@ app.get('/api/lectures', authenticate, async (req, res) => {
     if (chapterId) query.chapterId = chapterId;
     const lectures = await Lecture.find(query).sort('createdAt');
 
-    // Get all lecture IDs as strings for DPP lookup
     const lectureIds = lectures.map(l => l._id.toString());
-    // Find which lectures have a DPP
     const dpps = await Dpp.find({ lectureId: { $in: lectureIds } }, 'lectureId');
     const dppSet = new Set(dpps.map(d => d.lectureId));
 
-    // Attach completion status and hasDpp flag
     const progress = await Progress.find({ user: req.user.id, lecture: { $in: lectures.map(l => l._id) } });
     const completedIds = new Set(progress.map(p => p.lecture.toString()));
     const enriched = lectures.map(l => ({
         ...l.toObject(),
-                                        completed: completedIds.has(l._id.toString()),
-                                        hasDpp: dppSet.has(l._id.toString())   // true if a DPP exists for this lecture
+        completed: completedIds.has(l._id.toString()),
+        hasDpp: dppSet.has(l._id.toString())
     }));
     res.json(enriched);
 });
@@ -382,19 +317,20 @@ app.get('/api/lectures/:id', authenticate, async (req, res) => {
 });
 
 app.post('/api/lectures', authenticate, isAdmin, async (req, res) => {
-    const { subjectId, chapterId, title, date, duration, youtubeId, imageUrl, pdfLink, dppLink } = req.body;
+    const { subjectId, chapterId, title, date, duration, youtubeId, imageUrl, pdfLink, dppLink, downloadMode } = req.body;
     if (!subjectId || !chapterId || !title) return res.status(400).json({ success: false, msg: 'Missing required fields' });
     const lecture = await Lecture.create({
         subjectId, chapterId, title, date, duration, youtubeId, imageUrl,
         pdfLink, dppLink,
         printableNotesLink: req.body.printableNotesLink || '',
-        remark: req.body.remark || ''
+        remark: req.body.remark || '',
+        downloadMode: downloadMode || 'none'
     });
     res.json({ success: true, lecture });
 });
 
 app.put('/api/lectures/:id', authenticate, isAdmin, async (req, res) => {
-    const { title, youtubeId, imageUrl, pdfLink, dppLink, printableNotesLink, remark } = req.body;
+    const { title, youtubeId, imageUrl, pdfLink, dppLink, printableNotesLink, remark, downloadMode } = req.body;
     const updates = {};
     if (title !== undefined) updates.title = title;
     if (youtubeId !== undefined) updates.youtubeId = youtubeId;
@@ -403,6 +339,7 @@ app.put('/api/lectures/:id', authenticate, isAdmin, async (req, res) => {
     if (dppLink !== undefined) updates.dppLink = dppLink;
     if (printableNotesLink !== undefined) updates.printableNotesLink = printableNotesLink;
     if (remark !== undefined) updates.remark = remark;
+    if (downloadMode !== undefined) updates.downloadMode = downloadMode;
 
     const lecture = await Lecture.findByIdAndUpdate(req.params.id, updates, { new: true });
     res.json({ success: true, lecture });
@@ -423,7 +360,7 @@ app.post('/api/lectures/:id/complete', authenticate, async (req, res) => {
     await Progress.findOneAndUpdate(
         { user: req.user.id, lecture: req.params.id },
         { completed: true, completedAt: new Date() },
-                                    { upsert: true }
+        { upsert: true }
     );
     res.json({ success: true });
 });
@@ -441,25 +378,23 @@ app.post('/api/lectures/bulk', authenticate, isAdmin, async (req, res) => {
         for (const ch of chapters) {
             if (!ch.title || !Array.isArray(ch.lectures)) continue;
 
-            // Find or create the chapter
             let chapter = await Chapter.findOne({ subjectId, title: ch.title });
             if (!chapter) {
                 chapter = await Chapter.create({ subjectId, title: ch.title, order: Date.now() });
             }
 
-            // Create lectures for this chapter
             for (const lec of ch.lectures) {
                 if (!lec.title) continue;
                 await Lecture.create({
                     subjectId,
                     chapterId: chapter._id.toString(),
-                                     title: lec.title,
-                                     youtubeId: lec.youtubeId || '',
-                                     date: lec.date || '',
-                                     duration: lec.duration || '45m',
-                                     imageUrl: lec.imageUrl || '',
-                                     pdfLink: lec.pdfLink || '',
-                                     dppLink: lec.dppLink || ''
+                    title: lec.title,
+                    youtubeId: lec.youtubeId || '',
+                    date: lec.date || '',
+                    duration: lec.duration || '45m',
+                    imageUrl: lec.imageUrl || '',
+                    pdfLink: lec.pdfLink || '',
+                    dppLink: lec.dppLink || ''
                 });
                 createdCount++;
             }
@@ -478,13 +413,12 @@ app.post('/api/study-log', authenticate, async (req, res) => {
     if (!date) return res.status(400).json({ error: 'Date required' });
     const log = await StudyLog.findOneAndUpdate(
         { userId: req.user.id, date: new Date(date) },
-                                                { activities, totalMinutes, $setOnInsert: { userId: req.user.id, date: new Date(date) } },
-                                                { upsert: true, new: true }
+        { activities, totalMinutes, $setOnInsert: { userId: req.user.id, date: new Date(date) } },
+        { upsert: true, new: true }
     );
     res.json(log);
 });
 
-// Get study log for a date range (default last 7 days)
 app.get('/api/study-log', authenticate, async (req, res) => {
     const { start, end } = req.query;
     const endDate = end ? new Date(end) : new Date();
@@ -497,7 +431,6 @@ app.get('/api/study-log', authenticate, async (req, res) => {
 });
 
 // ---------- PLANNER TASKS ----------
-// Get all tasks for logged-in user (optional date filtering)
 app.get('/api/planner/tasks', authenticate, async (req, res) => {
     try {
         const { startDate, endDate, completed } = req.query;
@@ -520,7 +453,6 @@ app.get('/api/planner/tasks', authenticate, async (req, res) => {
     }
 });
 
-// Create a new task
 app.post('/api/planner/tasks', authenticate, async (req, res) => {
     try {
         const { title, description, subject, dueDate, priority, order } = req.body;
@@ -533,10 +465,10 @@ app.post('/api/planner/tasks', authenticate, async (req, res) => {
             description: description || '',
             subject: subject || 'other',
             dueDate: new Date(dueDate),
-                                              priority: priority || 'medium',
-                                              order: order || 0,
-                                              completed: false,
-                                              completedAt: null
+            priority: priority || 'medium',
+            order: order || 0,
+            completed: false,
+            completedAt: null
         });
         res.status(201).json(task);
     } catch (err) {
@@ -545,7 +477,6 @@ app.post('/api/planner/tasks', authenticate, async (req, res) => {
     }
 });
 
-// Update a task (title, description, subject, dueDate, priority, completed, order)
 app.put('/api/planner/tasks/:id', authenticate, async (req, res) => {
     try {
         const taskId = req.params.id;
@@ -555,7 +486,6 @@ app.put('/api/planner/tasks/:id', authenticate, async (req, res) => {
             return res.status(404).json({ error: 'Task not found' });
         }
 
-        // Allowed fields to update
         const allowed = ['title', 'description', 'subject', 'dueDate', 'priority', 'completed', 'order'];
         for (let field of allowed) {
             if (updates[field] !== undefined) {
@@ -563,7 +493,6 @@ app.put('/api/planner/tasks/:id', authenticate, async (req, res) => {
                 else task[field] = updates[field];
             }
         }
-        // If marking completed, set completedAt
         if (updates.completed === true && !task.completed) {
             task.completedAt = new Date();
         } else if (updates.completed === false) {
@@ -578,7 +507,6 @@ app.put('/api/planner/tasks/:id', authenticate, async (req, res) => {
     }
 });
 
-// Delete a task
 app.delete('/api/planner/tasks/:id', authenticate, async (req, res) => {
     try {
         const taskId = req.params.id;
@@ -593,7 +521,6 @@ app.delete('/api/planner/tasks/:id', authenticate, async (req, res) => {
     }
 });
 
-// Optional: Get a summary (counts completed/pending for the week)
 app.get('/api/planner/summary', authenticate, async (req, res) => {
     try {
         const today = new Date();
@@ -616,7 +543,7 @@ app.get('/api/planner/summary', authenticate, async (req, res) => {
     }
 });
 
-// Get due revisions for today
+// ---------- REVISIONS ----------
 app.get('/api/revisions/due', authenticate, async (req, res) => {
     const today = new Date();
     today.setHours(0,0,0,0);
@@ -627,39 +554,37 @@ app.get('/api/revisions/due', authenticate, async (req, res) => {
     res.json(due);
 });
 
-// Submit review result and update schedule (SM‑2 algorithm simplified)
 app.post('/api/revisions/review', authenticate, async (req, res) => {
-    const { revisionId, quality } = req.body; // quality 0-5 (0=forgot, 5=perfect)
-const item = await RevisionItem.findOne({ _id: revisionId, userId: req.user.id });
-if (!item) return res.status(404).json({ error: 'Not found' });
+    const { revisionId, quality } = req.body;
+    const item = await RevisionItem.findOne({ _id: revisionId, userId: req.user.id });
+    if (!item) return res.status(404).json({ error: 'Not found' });
 
-let { easeFactor, interval, repetitions } = item;
-if (quality >= 3) {
-    if (repetitions === 0) interval = 1;
-    else if (repetitions === 1) interval = 6;
-    else interval = Math.round(interval * easeFactor);
-    repetitions++;
-} else {
-    repetitions = 0;
-    interval = 1;
-}
-easeFactor = easeFactor + (0.1 - (5 - quality) * 0.08);
-if (easeFactor < 1.3) easeFactor = 1.3;
+    let { easeFactor, interval, repetitions } = item;
+    if (quality >= 3) {
+        if (repetitions === 0) interval = 1;
+        else if (repetitions === 1) interval = 6;
+        else interval = Math.round(interval * easeFactor);
+        repetitions++;
+    } else {
+        repetitions = 0;
+        interval = 1;
+    }
+    easeFactor = easeFactor + (0.1 - (5 - quality) * 0.08);
+    if (easeFactor < 1.3) easeFactor = 1.3;
 
-const nextReviewDate = new Date();
-nextReviewDate.setDate(nextReviewDate.getDate() + interval);
+    const nextReviewDate = new Date();
+    nextReviewDate.setDate(nextReviewDate.getDate() + interval);
 
-item.easeFactor = easeFactor;
-item.interval = interval;
-item.repetitions = repetitions;
-item.nextReviewDate = nextReviewDate;
-await item.save();
+    item.easeFactor = easeFactor;
+    item.interval = interval;
+    item.repetitions = repetitions;
+    item.nextReviewDate = nextReviewDate;
+    await item.save();
 
-res.json({ success: true, nextReviewDate });
+    res.json({ success: true, nextReviewDate });
 });
 
 // ---------- LIVE SCHEDULES ----------
-// GET today's live classes (for all authenticated users)
 app.get('/api/live/today', authenticate, async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     const schedules = await LiveSchedule.find({ date: today }).sort('time');
@@ -667,7 +592,7 @@ app.get('/api/live/today', authenticate, async (req, res) => {
 });
 
 app.get('/api/live', authenticate, isAdmin, async (req, res) => {
-    const { from, to } = req.query; // optional date filters
+    const { from, to } = req.query;
     let query = {};
     if (from) query.date = { $gte: from };
     if (to) query.date = { ...query.date, $lte: to };
@@ -685,6 +610,21 @@ app.post('/api/live', authenticate, isAdmin, async (req, res) => {
 app.delete('/api/live/:id', authenticate, isAdmin, async (req, res) => {
     await LiveSchedule.findByIdAndDelete(req.params.id);
     res.json({ success: true });
+});
+
+app.put('/api/live/:id', authenticate, isAdmin, async (req, res) => {
+    const { title, category, date, time, duration, youtubeId } = req.body;
+    try {
+        const schedule = await LiveSchedule.findByIdAndUpdate(
+            req.params.id,
+            { title, category, date, time, duration, youtubeId },
+            { new: true, runValidators: true }
+        );
+        if (!schedule) return res.status(404).json({ success: false, msg: 'Schedule not found' });
+        res.json({ success: true, schedule });
+    } catch (error) {
+        res.status(500).json({ success: false, msg: error.message });
+    }
 });
 
 // ---------- DPP ROUTES ----------
@@ -705,7 +645,6 @@ app.post('/api/dpp/upload', authenticate, isAdmin, async (req, res) => {
         if (!dppData.lectureId || !dppData.questions || !Array.isArray(dppData.questions)) {
             return res.status(400).json({ error: 'lectureId and questions array required' });
         }
-        // Normalize questions
         const normalized = dppData.questions.map((q, i) => ({
             id: q.id || `q${i+1}`,
             type: q.type || 'multiple-choice',
@@ -719,19 +658,18 @@ app.post('/api/dpp/upload', authenticate, isAdmin, async (req, res) => {
         normalized.forEach(q => {
             if (!q.topic) q.topic = detectTopic(q.questionText);
         });
-            dppData.questions = normalized;
-            const dpp = await Dpp.findOneAndUpdate(
-                { lectureId: dppData.lectureId },
-                dppData,
-                { upsert: true, new: true, runValidators: true }
-            );
-            res.json({ success: true, dpp });
+        dppData.questions = normalized;
+        const dpp = await Dpp.findOneAndUpdate(
+            { lectureId: dppData.lectureId },
+            dppData,
+            { upsert: true, new: true, runValidators: true }
+        );
+        res.json({ success: true, dpp });
     } catch (error) {
         res.status(400).json({ error: error.message });
     }
 });
 
-// ========== UPDATE DPP (PUT) ==========
 app.put('/api/dpp/:lectureId', authenticate, isAdmin, async (req, res) => {
     try {
         const { lectureId } = req.params;
@@ -741,7 +679,6 @@ app.put('/api/dpp/:lectureId', authenticate, isAdmin, async (req, res) => {
             return res.status(400).json({ error: 'questions array required' });
         }
 
-        // Normalize questions to match schema
         const normalizedQuestions = questions.map((q, i) => ({
             id: q.id || `q${i+1}`,
             type: q.type || 'multiple-choice',
@@ -754,7 +691,6 @@ app.put('/api/dpp/:lectureId', authenticate, isAdmin, async (req, res) => {
             topic: detectTopic(q.questionText || q.text || '')
         }));
 
-        // Find the DPP by lectureId and update questions
         const dpp = await Dpp.findOne({ lectureId });
         if (!dpp) {
             return res.status(404).json({ error: 'DPP not found' });
@@ -774,16 +710,13 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
     try {
         const { lectureId, lectureName, answers } = req.body;
 
-        // Validate required fields
         if (!lectureId || !lectureName || !answers) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
 
-        // 1. Fetch the DPP
         const dpp = await Dpp.findOne({ lectureId });
         if (!dpp) return res.status(404).json({ error: 'DPP not found' });
 
-        // 2. Calculate correct answers and processed answers
         let correctCount = 0;
         const processed = answers.map(ans => {
             const q = dpp.questions.find(q => q.id === ans.questionId);
@@ -794,7 +727,6 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
 
         const score = (correctCount / dpp.questions.length) * 100;
 
-        // 3. Save the DPP result
         const result = await DppResult.create({
             userId: req.user.id,
             lectureId,
@@ -806,7 +738,6 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
             submittedAt: new Date()
         });
 
-        // 4. Update topic performance and create revision items
         for (let i = 0; i < dpp.questions.length; i++) {
             const q = dpp.questions[i];
             const ans = answers.find(a => a.questionId === q.id);
@@ -817,11 +748,10 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
                 await TopicPerformance.findOneAndUpdate(
                     { userId: req.user.id, topic: topic, subtopic: '' },
                     { $inc: { totalQuestions: 1, correct: isCorrect ? 1 : 0 }, $set: { lastUpdated: new Date() } },
-                                                        { upsert: true }
+                    { upsert: true }
                 );
             }
 
-            // Create revision item for wrong/unanswered questions
             if (!ans || ans.selectedOption !== q.correctAnswer) {
                 const existing = await RevisionItem.findOne({ userId: req.user.id, questionId: q.id, lectureId: lectureId });
                 if (!existing) {
@@ -834,15 +764,14 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
                         options: q.options,
                         correctAnswer: q.correctAnswer,
                         nextReviewDate: new Date(Date.now() + 24 * 60 * 60 * 1000),
-                                              easeFactor: 2.5,
-                                              interval: 1,
-                                              repetitions: 0
+                        easeFactor: 2.5,
+                        interval: 1,
+                        repetitions: 0
                     });
                 }
             }
         }
 
-        // 5. Send response
         res.json({ success: true, result: { id: result._id, score, correctCount, totalQuestions: dpp.questions.length } });
     } catch (error) {
         console.error('DPP Submit Error:', error);
@@ -850,7 +779,6 @@ app.post('/api/dpp/submit', authenticate, async (req, res) => {
     }
 });
 
-// DELETE DPP by lectureId
 app.delete('/api/dpp/:lectureId', authenticate, isAdmin, async (req, res) => {
     try {
         const { lectureId } = req.params;
@@ -858,7 +786,6 @@ app.delete('/api/dpp/:lectureId', authenticate, isAdmin, async (req, res) => {
         if (!dpp) {
             return res.status(404).json({ error: 'DPP not found' });
         }
-        // Also delete all results for this DPP
         await DppResult.deleteMany({ lectureId });
         res.json({ success: true, message: 'DPP and associated results deleted' });
     } catch (error) {
@@ -872,143 +799,63 @@ app.get('/api/dpp/analytics/:lectureId', authenticate, async (req, res) => {
     res.json({ attempts: results });
 });
 
-// ---------- FORGOT / RESET PASSWORD ----------
-app.post('/api/forgot-password', async (req, res) => {
-    const { email } = req.body;
-
-    const user = await User.findOne({ email });
-    if (!user) {
-        return res.status(404).json({ success: false, msg: 'No account with that email' });
-    }
-
-    // Generate reset token
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-
-    // Save token to user
-    user.resetPasswordToken = token;
-    user.resetPasswordExpires = Date.now() + 3600000; // 1 hour
-    await user.save();
-
-    // Create reset link
-    const resetLink = `${process.env.BASE_URL || 'http://localhost:3000'}/reset-password.html?token=${token}`;
-
-    // Beautiful HTML Email Template
-    const htmlTemplate = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Reset Password</title>
-    </head>
-    <body style="margin:0; padding:0; background:#1a1a1a; font-family:Arial, sans-serif;">
-    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#1a1a1a;">
-    <tr>
-    <td align="center">
-    <table width="100%" cellpadding="20" cellspacing="0" border="0" style="max-width:600px;">
-    <tr>
-    <td style="padding:40px 20px;">
-
-    <h2 style="color:#ffffff; text-align:center; margin:0 0 30px 0; font-size:26px;">
-    Reset Password
-    </h2>
-
-    <!-- Main Dark Box with Big Click Here -->
-    <div style="background:#111111; padding:40px 30px; border-radius:16px; text-align:center;">
-
-    <p style="color:#a0a0ff; font-size:19px; margin:0 0 25px 0; font-weight:600;">
-    Click here to reset your password
-    </p>
-
-    <!-- Big Centered CLICK HERE Button -->
-    <a href="${resetLink}"
-    style="display:inline-block;
-    font-size:46px;
-    letter-spacing:14px;
-    color:#5b9cff;
-    text-decoration:none;
-    font-weight:bold;
-    background:#222222;
-    padding:25px 55px;
-    border-radius:14px;
-    box-shadow:0 8px 25px rgba(91, 156, 255, 0.3);
-    margin:10px 0 20px 0;">
-    CLICK HERE
-    </a>
-
-    <p style="color:#888888; font-size:15px; margin:20px 0 0 0;">
-    This link expires in <strong>1 hour</strong>.
-    </p>
-    </div>
-
-    <!-- Safety note -->
-    <p style="text-align:center; color:#666666; font-size:14px; margin:30px 0 0 0;">
-    If you didn’t request a password reset, you can safely ignore this email.
-    </p>
-
-    </td>
-    </tr>
-    </table>
-    </tr>
-    <tr>
-    </table>
-    </body>
-    </html>`;
-
-    // Send email
+// ---------- ANALYTICS ----------
+app.get('/api/analytics/topics', authenticate, async (req, res) => {
     try {
-        await transporter.sendMail({
-            from: '"Your App Name" <no-reply@yourdomain.com>',   // ← Change this
-            to: email,
-            subject: 'Reset Password',
-            html: htmlTemplate
-        });
-
-        res.json({ success: true, msg: 'Reset link sent to your email' });
+        let performances = await TopicPerformance.find({ userId: req.user.id });
+        if (!performances) performances = [];
+        performances.sort((a, b) => (a.accuracy || 0) - (b.accuracy || 0));
+        res.json(performances);
     } catch (error) {
-        console.error('Email sending error:', error);
-        res.status(500).json({ success: false, msg: 'Failed to send email' });
+        console.error('Analytics error:', error);
+        res.status(500).json([]);
     }
 });
 
-app.post('/api/reset-password', async (req, res) => {
-    const { token, newPassword } = req.body;
-    const user = await User.findOne({ resetPasswordToken: token, resetPasswordExpires: { $gt: Date.now() } });
-    if (!user) return res.status(400).json({ success: false, msg: 'Invalid or expired token' });
-    //user.password = await bcrypt.hash(newPassword, 10);
-    user.password = newPassword;
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpires = undefined;
-    await user.save();
-    res.json({ success: true, msg: 'Password reset successful' });
+app.get('/api/analytics/weak-topics', authenticate, async (req, res) => {
+    const threshold = parseInt(req.query.threshold) || 50;
+    let all = await TopicPerformance.find({ userId: req.user.id, totalQuestions: { $gt: 5 } });
+    const weak = all.filter(p => p.accuracy < threshold);
+    res.json(weak);
 });
 
-// ---------- SEEDING (Admin & Subjects) ----------
-async function seedAdmin() {
-    const existing = await User.findOne({ role: 'admin' });
-    if (!existing && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
-        //const hashed = await bcrypt.hash(process.env.ADMIN_PASSWORD, 10);
-        await User.create({ name: 'Admin', email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD, role: 'admin'});
-        console.log('✅ Admin seeded');
+app.get('/api/practice/custom', authenticate, async (req, res) => {
+    let topics = req.query.topics;
+    if (!topics) return res.status(400).json({ error: 'topics required' });
+    const topicArray = topics.split(',').map(t => t.trim());
+    const limit = parseInt(req.query.limit) || 10;
+
+    const dpps = await Dpp.find({});
+    let questions = [];
+
+    for (const dpp of dpps) {
+        for (const q of dpp.questions) {
+            const questionTopic = q.topic || detectTopic(q.questionText);
+            if (topicArray.includes(questionTopic)) {
+                questions.push({
+                    id: q.id,
+                    text: q.questionText,
+                    options: q.options,
+                    correctAnswer: q.correctAnswer,
+                    topic: questionTopic,
+                    lectureId: dpp.lectureId,
+                    lectureName: dpp.lectureName,
+                    explanation: q.explanation || ''
+                });
+            }
+        }
     }
-}
-async function seedSubjects() {
-    const count = await Subject.countDocuments();
-    if (count === 0) {
-        await Subject.insertMany([
-            { name: 'Quantitative Aptitude', icon: '📊', color: 'blue', order: 1 },
-            { name: 'Reasoning Ability', icon: '🧠', color: 'purple', order: 2 },
-            { name: 'English Language', icon: '📖', color: 'green', order: 3 },
-            { name: 'Banking Awareness', icon: '🏦', color: 'orange', order: 4 },
-            { name: 'Current Affairs', icon: '🌍', color: 'red', order: 5 }
-        ]);
-        console.log('✅ Default subjects seeded');
+
+    for (let i = questions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [questions[i], questions[j]] = [questions[j], questions[i]];
     }
-}
+    questions = questions.slice(0, limit);
+
+    res.json(questions);
+});
 
 // ---------- MOTIVATION SCHEDULE ----------
-
-// Get current active schedule (used by dashboard popup)
 app.get('/api/motivation/current', authenticate, async (req, res) => {
     try {
         const schedule = await MotivationSchedule.findOne({ isActive: true });
@@ -1049,13 +896,11 @@ app.get('/api/motivation/current', authenticate, async (req, res) => {
     }
 });
 
-// Admin: Get all schedules
 app.get('/api/motivation', authenticate, isAdmin, async (req, res) => {
     const schedules = await MotivationSchedule.find().sort('-createdAt');
     res.json(schedules);
 });
 
-// Admin: Create a new schedule
 app.post('/api/motivation', authenticate, isAdmin, async (req, res) => {
     try {
         const { startDate, weeks, isActive } = req.body;
@@ -1075,7 +920,6 @@ app.post('/api/motivation', authenticate, isAdmin, async (req, res) => {
     }
 });
 
-// Admin: Update a schedule
 app.put('/api/motivation/:id', authenticate, isAdmin, async (req, res) => {
     try {
         const updates = req.body;
@@ -1090,7 +934,6 @@ app.put('/api/motivation/:id', authenticate, isAdmin, async (req, res) => {
     }
 });
 
-// Admin: Delete a schedule
 app.delete('/api/motivation/:id', authenticate, isAdmin, async (req, res) => {
     try {
         await MotivationSchedule.findByIdAndDelete(req.params.id);
@@ -1101,7 +944,29 @@ app.delete('/api/motivation/:id', authenticate, isAdmin, async (req, res) => {
     }
 });
 
-// ========== STATIC FILES (MUST BE AFTER API ROUTES) ==========
+// ========== SEEDING ==========
+async function seedAdmin() {
+    const existing = await User.findOne({ role: 'admin' });
+    if (!existing && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
+        await User.create({ name: 'Admin', email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD, role: 'admin' });
+        console.log('✅ Admin seeded');
+    }
+}
+async function seedSubjects() {
+    const count = await Subject.countDocuments();
+    if (count === 0) {
+        await Subject.insertMany([
+            { name: 'Quantitative Aptitude', icon: '📊', color: 'blue', order: 1 },
+            { name: 'Reasoning Ability', icon: '🧠', color: 'purple', order: 2 },
+            { name: 'English Language', icon: '📖', color: 'green', order: 3 },
+            { name: 'Banking Awareness', icon: '🏦', color: 'orange', order: 4 },
+            { name: 'Current Affairs', icon: '🌍', color: 'red', order: 5 }
+        ]);
+        console.log('✅ Default subjects seeded');
+    }
+}
+
+// ========== STATIC FILES ==========
 app.use(express.static('public'));
 
 // ========== START SERVER ==========
